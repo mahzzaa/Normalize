@@ -11,74 +11,87 @@ from tensorflow.keras.optimizers import Adam
 
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
-# ---------- 1. Load windowed data from JSON ----------
+# ------------------------------------------------------------------
+# 1. Load NORMAL windows (for training the autoencoder)
+#    -> from: sensor_data_14th_may_1600_windows.json
+# ------------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(__file__)
-json_path = os.path.join(BASE_DIR, "sensor_data_14th_may_1600_windows.json")
 
-with open(json_path, "r") as f:
-    payload = json.load(f)
+normal_json_path = os.path.join(BASE_DIR, "sensor_data_14th_may_1600_windows.json")
+with open(normal_json_path, "r") as f:
+    normal_payload = json.load(f)
 
-# X shape: (num_windows, seq_len, 3)
-X = np.array(payload["windows"], dtype="float32")
+X_normal = np.array(normal_payload["windows"], dtype="float32")   # shape: (N_normal, seq_len, features)
 
-print("Loaded windows:")
-print("  X shape:", X.shape)  # e.g. (420, 100, 3)
+print("Loaded NORMAL windows (training data):")
+print("  X_normal shape:", X_normal.shape)
 
-num_samples, seq_len, num_features = X.shape
+num_normal, seq_len, num_features = X_normal.shape
 
-# Optional: labels for classification (0 = normal, 1 = abnormal)
-y = None
-if "labels" in payload:
-    y = np.array(payload["labels"], dtype="int32")
-    if y.shape[0] != num_samples:
-        raise ValueError(
-            f"Number of labels ({y.shape[0]}) does not match number of windows ({num_samples})."
-        )
-    print("  Loaded labels with shape:", y.shape)
-else:
-    print("  No 'labels' field found in JSON. Classification accuracy will be skipped.")
+# ------------------------------------------------------------------
+# 2. Load dataset with labels (NORMAL + synthetic ABNORMAL)
+#    -> from: sensor_data_14th_may_1600_windows_with_labels.json
+# ------------------------------------------------------------------
 
-# ---------- 2. Build LSTM Autoencoder model ----------
+labeled_json_path = os.path.join(BASE_DIR, "sensor_data_14th_may_1600_windows_with_labels.json")
+with open(labeled_json_path, "r") as f:
+    labeled_payload = json.load(f)
 
-# Latent dimension (size of the encoded vector)
-latent_dim = 64
+X_all = np.array(labeled_payload["windows"], dtype="float32")
+y_all = np.array(labeled_payload["labels"], dtype="int32")   # 0 = normal, 1 = abnormal
 
-# Input shape: (time_steps, features) = (seq_len, 3)
+print("\nLoaded LABELED dataset (for evaluation):")
+print("  X_all shape:", X_all.shape)
+print("  y_all shape:", y_all.shape)
+print("  #normal (label=0):", int((y_all == 0).sum()))
+print("  #abnormal (label=1):", int((y_all == 1).sum()))
+
+# Basic consistency checks
+if X_all.shape[1] != seq_len or X_all.shape[2] != num_features:
+    raise ValueError("Shape mismatch between normal windows and labeled dataset.")
+if X_all.shape[0] != y_all.shape[0]:
+    raise ValueError("Number of windows and labels do not match in labeled dataset.")
+
+# ------------------------------------------------------------------
+# 3. Build LSTM Autoencoder model
+# ------------------------------------------------------------------
+
+latent_dim = 64  # size of the encoded vector
+
 inputs = Input(shape=(seq_len, num_features), name="input_sequence")
 
-# Encoder: compress sequence into a single vector
+# Encoder
 encoded = LSTM(latent_dim, name="encoder_lstm")(inputs)
 
-# Repeat the encoded vector seq_len times to prepare for decoding
+# Bottleneck
 bottleneck = RepeatVector(seq_len, name="repeat_vector")(encoded)
 
-# Decoder: reconstruct the original sequence
+# Decoder
 decoded = LSTM(latent_dim, return_sequences=True, name="decoder_lstm")(bottleneck)
-
-# TimeDistributed(Dense) outputs a 3D tensor with shape (batch, time, features)
 outputs = TimeDistributed(Dense(num_features), name="decoder_output")(decoded)
 
-# Full autoencoder model: input -> reconstructed sequence
 autoencoder = Model(inputs, outputs, name="gait_lstm_autoencoder")
 
 autoencoder.compile(
     optimizer=Adam(learning_rate=1e-3),
-    loss="mse"   # mean squared error between input and reconstructed output
+    loss="mse"
 )
 
 print("\nModel summary:")
 autoencoder.summary()
 
-# ---------- 3. Train the autoencoder ----------
+# ------------------------------------------------------------------
+# 4. Train the autoencoder ONLY on NORMAL data
+# ------------------------------------------------------------------
 
 EPOCHS = 40
 BATCH_SIZE = 32
 VAL_SPLIT = 0.2
 
-print("\nStarting training...")
+print("\nStarting training on NORMAL windows...")
 history = autoencoder.fit(
-    X, X,                     # input = target (autoencoder learns to reconstruct X)
+    X_normal, X_normal,
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
     validation_split=VAL_SPLIT,
@@ -87,68 +100,73 @@ history = autoencoder.fit(
 
 print("\nTraining finished.")
 
-# ---------- 3.1 Plot training / validation loss ----------
+# ------------------------------------------------------------------
+# 4.1 Plot training / validation loss
+# ------------------------------------------------------------------
 
 plt.figure()
 plt.plot(history.history["loss"], label="Train loss")
 plt.plot(history.history["val_loss"], label="Validation loss")
 plt.xlabel("Epoch")
 plt.ylabel("MSE loss")
-plt.title("LSTM Autoencoder Reconstruction Loss")
+plt.title("LSTM Autoencoder Reconstruction Loss (Normal training data)")
 plt.legend()
 plot_path = os.path.join(BASE_DIR, "loss_curve.png")
 plt.savefig(plot_path, dpi=150, bbox_inches="tight")
 print(f"Saved loss curve to: {plot_path}")
 plt.close()
 
-# ---------- 4. Save the trained model ----------
+# Also print final loss values
+final_train_loss = history.history["loss"][-1]
+final_val_loss = history.history["val_loss"][-1]
+print("\nFinal training loss (MSE):", float(final_train_loss))
+print("Final validation loss (MSE):", float(final_val_loss))
+
+# ------------------------------------------------------------------
+# 5. Save the trained model
+# ------------------------------------------------------------------
 
 model_path = os.path.join(BASE_DIR, "gait_lstm_autoencoder.h5")
 autoencoder.save(model_path)
 print(f"\n✅ Saved trained model to: {model_path}")
 
-# ---------- 5. Reconstruction error on training data ----------
+# ------------------------------------------------------------------
+# 6. Reconstruction error on LABELED dataset (normal + abnormal)
+# ------------------------------------------------------------------
 
-reconstructed = autoencoder.predict(X)
-# Mean squared error per window
-errors = np.mean(np.square(X - reconstructed), axis=(1, 2))
+reconstructed_all = autoencoder.predict(X_all)
+errors_all = np.mean(np.square(X_all - reconstructed_all), axis=(1, 2))
 
-print("\nReconstruction error stats on training data:")
-print("  min :", float(errors.min()))
-print("  max :", float(errors.max()))
-print("  mean:", float(errors.mean()))
-print("  std :", float(errors.std()))
+print("\nReconstruction error stats on LABELED data:")
+print("  min :", float(errors_all.min()))
+print("  max :", float(errors_all.max()))
+print("  mean:", float(errors_all.mean()))
+print("  std :", float(errors_all.std()))
 
-# ---------- 6. Optional: classification using reconstruction error ----------
+# ------------------------------------------------------------------
+# 7. Classification using reconstruction error
+# ------------------------------------------------------------------
 
-if y is not None:
-    # Assume: y = 0 (normal), y = 1 (abnormal)
-
-    # Select only normal windows to set threshold
-    mask_normal = (y == 0)
-    if not np.any(mask_normal):
-        print("\n[Classification] No normal samples (label 0) found. "
-              "Cannot compute threshold-based accuracy.")
-    else:
-        normal_errors = errors[mask_normal]
-
-        # e.g., threshold = 95th percentile of normal reconstruct‍ion error
-        threshold = np.percentile(normal_errors, 95)
-        print("\n[Classification] Selected threshold (95th percentile of normal errors):",
-              float(threshold))
-
-        # Predict: error > threshold → abnormal (1), else normal (0)
-        y_pred = (errors > threshold).astype(int)
-
-        acc = accuracy_score(y, y_pred)
-        acc = accuracy_score(y, y_pred)
-        cm = confusion_matrix(y, y_pred)
-        report = classification_report(y, y_pred, digits=3)
-
-        print("\n[Classification] Accuracy based on reconstruction error:")
-        print("  Accuracy:", float(acc))
-        print("Confusion matrix:\n", cm)
-        print("Classification report:\n", report)
+# Use only normal samples (label=0) in the LABELED dataset to set the threshold
+mask_normal = (y_all == 0)
+if not np.any(mask_normal):
+    print("\n[Classification] No normal samples (label 0) found in labeled dataset.")
 else:
-    print("\nNo labels provided → only reconstruction loss is reported, "
-          "classification accuracy is not computed.")
+    normal_errors = errors_all[mask_normal]
+
+    # Threshold: 95th percentile of normal reconstruction error
+    threshold = np.percentile(normal_errors, 95)
+    print("\n[Classification] Selected threshold (95th percentile of normal errors):",
+          float(threshold))
+
+    # Predict: error > threshold → abnormal (1), else normal (0)
+    y_pred = (errors_all > threshold).astype(int)
+
+    acc = accuracy_score(y_all, y_pred)
+    cm = confusion_matrix(y_all, y_pred)
+    report = classification_report(y_all, y_pred, digits=3)
+
+    print("\n[Classification] Accuracy based on reconstruction error:")
+    print("  Accuracy:", float(acc))
+    print("Confusion matrix:\n", cm)
+    print("Classification report:\n", report)
